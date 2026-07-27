@@ -5,7 +5,12 @@ import tempfile
 import pymupdf
 
 from src import config
-from src.ingest.documents import parse_pdf, sniff_kind_ext
+from src.ingest.documents import (
+    parse_pdf,
+    parse_pptx,
+    rendered_pptx_path,
+    sniff_kind_ext,
+)
 
 
 def _fixture_pdf() -> pathlib.Path:
@@ -43,3 +48,25 @@ def test_sniff():
     assert sniff_kind_ext(b"%PDF-1.7 ...") == ".pdf"
     assert sniff_kind_ext(b"PK\x03\x04rest") == ".pptx"
     assert sniff_kind_ext(b"<html>") is None
+
+
+def test_parse_pptx_renders_complete_slides():
+    from pptx import Presentation
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.util import Inches
+
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    shape = slide.shapes.add_shape(
+        MSO_SHAPE.ROUNDED_RECTANGLE, Inches(1), Inches(1), Inches(5), Inches(2))
+    shape.text = "Shape-based self-attention diagram"
+    shape.fill.solid()
+    path = pathlib.Path(tempfile.mkdtemp()) / "fixture.pptx"
+    prs.save(path)
+
+    pages, renders = parse_pptx(path)
+
+    assert len(pages) == 1
+    assert "self-attention" in pages[0].text
+    assert len(renders) == 1 and renders[0][:3] == b"\xff\xd8\xff"
+    assert rendered_pptx_path(path).exists()

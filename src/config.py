@@ -218,6 +218,11 @@ TEXT_COLLECTION = os.getenv("TEXT_COLLECTION", "moments_text")
 # branches fuse by RANK (RRF), so the text model is independent of CLIP.
 TEXT_EMBED_PROVIDER = os.getenv("TEXT_EMBED_PROVIDER", "fastembed").strip().lower()
 _TE_OPENAI = TEXT_EMBED_PROVIDER == "openai"
+# Text embeddings can share the CLIP service for a simple local deployment, or
+# run locally when explicitly blank. Fly keeps the two model families in
+# separate processes so a 2 GB CLIP VM never co-resides with ONNX BGE.
+TEXT_EMBED_SERVICE_URL = os.getenv(
+    "TEXT_EMBED_SERVICE_URL", CLIP_SERVICE_URL).strip().rstrip("/")
 TEXT_EMBED_MODEL = os.getenv(
     "TEXT_EMBED_MODEL",
     "text-embedding-3-small" if _TE_OPENAI else "BAAI/bge-small-en-v1.5")
@@ -227,6 +232,10 @@ TEXT_EMBED_DIM = _int("TEXT_EMBED_DIM", 1536 if _TE_OPENAI else 384)
 TEXT_EMBED_API_KEY = os.getenv("TEXT_EMBED_API_KEY", "").strip()
 TEXT_EMBED_BASE_URL = os.getenv("TEXT_EMBED_BASE_URL", "").strip()
 TEXT_EMBED_VERSION = os.getenv("TEXT_EMBED_VERSION", f"{TEXT_EMBED_MODEL}-v1")
+# Keep peak inference memory bounded on small CPU model servers. The document
+# pipeline may upsert hundreds of chunks at once, but embedding those chunks in
+# smaller calls avoids transient ONNX allocations pushing a 2 GB service OOM.
+TEXT_EMBED_BATCH = max(1, _int("TEXT_EMBED_BATCH", 64))
 # Transcript chunking: group caption cues into ~CHUNK_SECONDS windows so a chunk
 # is a coherent spoken passage with a real t_start/t_end, not one tiny cue.
 TRANSCRIPT_CHUNK_SECONDS = _float("TRANSCRIPT_CHUNK_SECONDS", 20.0)

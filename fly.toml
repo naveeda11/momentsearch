@@ -6,7 +6,10 @@
 # automatically — then just `fly secrets set STORAGE_PROVIDER=flyio`.
 #
 # fly launch --no-deploy --copy-config
-# Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^FLY_' } | fly secrets import
+# Do not import CLIP_SERVICE_URL from .env: it is process wiring defined below,
+# not a secret. A blank secret overrides [env] and makes 2 GB workers load both
+# embedding models in-process, which can OOM document flows.
+# Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^(FLY_|CLIP_SERVICE_URL=)' } | fly secrets import
 # fly deploy --ha=false
 # fly scale count worker=2        # more ingest throughput, anytime
 
@@ -28,12 +31,16 @@ primary_region = 'iad'
   # read path never waits behind bulk ingest embed batches — a backfill
   # pushing 256-chunk batches through one model lock made search p95 jump
   # 14x. Per-process env isn't supported in [env], so api overrides it inline.
-  api = "sh -c 'CLIP_SERVICE_URL=http://clip-query.process.momentsearch-naveed.internal:8001 uvicorn src.app:app --host 0.0.0.0 --port 8000'"
-  worker = 'python -m src.worker'
+  # BGE stays local to the thin API/worker processes. Keeping it out of the
+  # Torch CLIP processes prevents the two runtimes co-residing on a 2 GB VM.
+  api = "sh -c 'TEXT_EMBED_SERVICE_URL= CLIP_SERVICE_URL=http://clip-query.process.momentsearch-naveed.internal:8001 uvicorn src.app:app --host 0.0.0.0 --port 8000'"
+  worker = "sh -c 'TEXT_EMBED_SERVICE_URL= python -m src.worker'"
   # Must bind IPv6 (::) — Fly private networking (*.internal, used by
   # CLIP_SERVICE_URL) is IPv6-only; 0.0.0.0 would be unreachable internally.
-  clip = 'uvicorn src.clip_service:app --host :: --port 8001'
-  clip-query = 'uvicorn src.clip_service:app --host :: --port 8001'
+  # These servers are CLIP-only on Fly. The endpoints remain available for the
+  # simpler shared-model Docker topology, but BGE is not preloaded here.
+  clip = "sh -c 'ENABLE_TRANSCRIPT=false uvicorn src.clip_service:app --host :: --port 8001'"
+  clip-query = "sh -c 'ENABLE_TRANSCRIPT=false uvicorn src.clip_service:app --host :: --port 8001'"
 
 [env]
   # Fly private networking: <process>.process.<app>.internal resolves to the
@@ -41,6 +48,9 @@ primary_region = 'iad'
   # overrides this to clip-query in its process command (read-path isolation);
   # clip_service itself ignores this and always runs the model locally.
   CLIP_SERVICE_URL = 'http://clip.process.momentsearch-naveed.internal:8001'
+  # The worker supervisor uses ~165 MB; batches of 64 pushed local BGE to
+  # ~1.74 GB RSS. Eight leaves safe headroom inside the unchanged 2 GB VM.
+  TEXT_EMBED_BATCH = '8'
 
 # Infra backstop: if a machine's process ever exits (crash, OOM, a dependency
 # outage that slips past the code's own retry loop), always bring it back —

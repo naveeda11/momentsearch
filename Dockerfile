@@ -6,10 +6,11 @@
 FROM python:3.11-slim
 
 # ffmpeg = frame sampling. nodejs = the JavaScript runtime yt-dlp needs to
-# extract YouTube formats (without it, EVERY YouTube video fails with "This
-# video is not available"). Both matter only to the worker but cost little here.
+# extract YouTube formats. libreoffice-impress renders complete PPTX slides to
+# PDF; python-pptx alone can extract text but cannot rasterize shapes/charts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    libreoffice-impress \
     nodejs \
     && rm -rf /var/lib/apt/lists/*
 

@@ -132,10 +132,12 @@ def embed_openai(texts: list[str]) -> np.ndarray:
 
 # ── Remote inference (CLIP_SERVICE_URL set) ──────────────────────────────────
 
-def _post(path: str, payload: dict, timeout: int = 600) -> dict:
+def _post(path: str, payload: dict, timeout: int = 600,
+          service_url: str | None = None) -> dict:
     """POST to the clip service, retrying while it warms up at boot (the model
     load takes ~30s; workers may start first)."""
-    url = config.CLIP_SERVICE_URL + path
+    base_url = config.CLIP_SERVICE_URL if service_url is None else service_url
+    url = base_url + path
     body = json.dumps(payload).encode()
     last: Exception | None = None
     for _ in range(12):  # up to ~60s of patience for a cold service
@@ -147,7 +149,7 @@ def _post(path: str, payload: dict, timeout: int = 600) -> dict:
         except urllib.error.URLError as exc:
             last = exc
             time.sleep(5)
-    raise RuntimeError(f"CLIP service unreachable at {config.CLIP_SERVICE_URL}: {last}")
+    raise RuntimeError(f"embedding service unreachable at {base_url}: {last}")
 
 
 # ── Public API (mode dispatch) ────────────────────────────────────────────────
@@ -174,15 +176,29 @@ def embed_text(text: str) -> np.ndarray:
 
 def embed_docs(texts: list[str]) -> np.ndarray:
     """Transcript chunks -> text vectors. Provider decides: OpenAI API, else bge
-    via the remote clip service, else bge in-process."""
-    if config.TEXT_EMBED_PROVIDER == "openai":
-        return embed_openai(texts)
-    if config.CLIP_SERVICE_URL:
-        if not texts:
-            return np.zeros((0, config.TEXT_EMBED_DIM), dtype=np.float32)
-        vecs = _post("/embed/docs", {"texts": texts})["vectors"]
-        return np.asarray(vecs, dtype=np.float32)
-    return embed_docs_local(texts)
+    via the remote clip service, else bge in-process.
+
+    Callers may hand us a full paper or transcript. Bound each inference call so
+    model-server peak memory does not scale with document size; concatenate the
+    vectors in original order before the caller's idempotent Qdrant upsert.
+    """
+    if not texts:
+        return np.zeros((0, config.TEXT_EMBED_DIM), dtype=np.float32)
+
+    batches: list[np.ndarray] = []
+    for start in range(0, len(texts), config.TEXT_EMBED_BATCH):
+        batch = texts[start:start + config.TEXT_EMBED_BATCH]
+        if config.TEXT_EMBED_PROVIDER == "openai":
+            vecs = embed_openai(batch)
+        elif config.TEXT_EMBED_SERVICE_URL:
+            remote = _post(
+                "/embed/docs", {"texts": batch},
+                service_url=config.TEXT_EMBED_SERVICE_URL)["vectors"]
+            vecs = np.asarray(remote, dtype=np.float32)
+        else:
+            vecs = embed_docs_local(batch)
+        batches.append(vecs)
+    return np.concatenate(batches, axis=0)
 
 
 def embed_query(text: str) -> np.ndarray:
@@ -190,7 +206,9 @@ def embed_query(text: str) -> np.ndarray:
     dispatch as embed_docs)."""
     if config.TEXT_EMBED_PROVIDER == "openai":
         return embed_openai([text])[0]
-    if config.CLIP_SERVICE_URL:
-        vec = _post("/embed/query", {"text": text}, timeout=60)["vector"]
+    if config.TEXT_EMBED_SERVICE_URL:
+        vec = _post(
+            "/embed/query", {"text": text}, timeout=60,
+            service_url=config.TEXT_EMBED_SERVICE_URL)["vector"]
         return np.asarray(vec, dtype=np.float32)
     return embed_query_local(text)

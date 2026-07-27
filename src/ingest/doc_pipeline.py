@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Lock
 
 from prefect import flow, task
 
@@ -89,6 +90,11 @@ def t_doc_parse(doc_id: str, user_id: str, path: str, source_hash: str) -> list[
     pages, renders = docs_mod.parse_document(Path(path))
     if not pages:
         raise RuntimeError("document parsed to zero pages/slides")
+    rendered_pptx = docs_mod.rendered_pptx_path(Path(path))
+    if rendered_pptx.exists():
+        storage.upload_file(
+            rendered_pptx, storage.doc_render_key(user_id, doc_id),
+            "application/pdf")
 
     # Idempotent re-run: clear renders a previous attempt half-uploaded.
     storage.delete_prefix(storage.page_prefix(user_id, doc_id))
@@ -132,22 +138,29 @@ def t_doc_enrich(doc_id: str, user_id: str, source_hash: str, kind: str,
 
     what = "slide" if kind == "deck" else "page of a research paper"
     done = 0
+    checkpoint_lock = Lock()
 
     def _caption(p: PageRec) -> None:
         nonlocal done
         try:
             jpeg = storage.get_bytes(storage.page_key(user_id, doc_id, p.page))
             p.caption = llm.caption_image(jpeg, cfg, what)
+            # Serialize checkpoint writes while keeping the expensive LLM calls
+            # concurrent. A hard kill now loses at most the caption currently in
+            # flight instead of every caption completed by this task.
+            with checkpoint_lock:
+                docs_mod.save_checkpoint(user_id, doc_id, source_hash, pages)
         except Exception as exc:
             print(f"[enrich] {doc_id} p.{p.page}: caption failed "
                   f"({type(exc).__name__}: {exc}) — continuing")
-        done += 1
-        db.set_progress(doc_id, done / len(todo))
+        with checkpoint_lock:
+            done += 1
+            progress = done / len(todo)
+        db.set_progress(doc_id, progress)
 
     try:
         with ThreadPoolExecutor(max_workers=_CAPTION_POOL) as ex:
             list(ex.map(_caption, todo))
-        docs_mod.save_checkpoint(user_id, doc_id, source_hash, pages)
         ok = sum(1 for p in todo if p.caption)
         print(f"[enrich] {doc_id}: captioned {ok}/{len(todo)} image-only pages")
     except Exception as exc:
@@ -205,3 +218,4 @@ def ingest_document(doc_id: str, user_id: str, kind: str = "paper") -> dict:
     finally:
         if path:
             Path(path).unlink(missing_ok=True)
+            docs_mod.rendered_pptx_path(Path(path)).unlink(missing_ok=True)

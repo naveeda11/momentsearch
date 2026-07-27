@@ -204,16 +204,19 @@ def page(doc_id: str, name: str, u: str | None = None):
 
 
 @router.get("/api/doc/{doc_id}")
-def doc(doc_id: str, u: str | None = None):
+def doc(doc_id: str, u: str | None = None, converted: int = 0):
     """The stored original PDF/PPTX — correct content-type so a browser's PDF
     viewer honors #page=N deeplinks (local-dev; buckets presign)."""
     uid = _uid(u)
     row = db.get_video(doc_id)
     if row is None or row["user_id"] != uid or not row.get("storage_key"):
         raise HTTPException(404, "Document not found.")
+    key = (storage.doc_render_key(uid, doc_id)
+           if converted else row["storage_key"])
     if storage.presign_capable():
-        raise HTTPException(404, "Documents are served from object storage.")
-    fp = storage.local_path(row["storage_key"])
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(storage.presign_get(key))
+    fp = storage.local_path(key)
     if not fp.exists():
         raise HTTPException(404, "Document file not found.")
     media = ("application/pdf" if fp.suffix == ".pdf"

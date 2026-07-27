@@ -185,7 +185,10 @@ def retry(video_id: str, uid: str = Depends(user_id)):
     db.set_status(video_id, "pending", error=None)
     if config.ENABLE_FAIR_DISPATCH:
         return {"video_id": video_id, "status": "pending"}  # dispatcher re-admits it fairly
-    flow_run_id = jobs.enqueue_video(video_id, uid)
+    # FIFO mode still has to respect the source kind. Routing every retry through
+    # the video deployment made paper/deck retries enter the wrong flow whenever
+    # fair dispatch was disabled.
+    flow_run_id = jobs.enqueue_source(row)
     return {"video_id": video_id, "status": "pending", "flow_run_id": flow_run_id}
 
 
@@ -201,7 +204,12 @@ def delete(video_id: str, uid: str = Depends(user_id)):
     if row is None or row["user_id"] != uid:
         raise HTTPException(404, "Video not found.")
     vector_store.delete_video(uid, video_id)
-    storage.delete_prefix(storage.frame_prefix(uid, video_id))
+    if (row.get("kind") or "video") in ("paper", "deck"):
+        storage.delete_prefix(storage.page_prefix(uid, video_id))
+        storage.delete_key(storage.parsed_key(uid, video_id))
+        storage.delete_key(storage.doc_render_key(uid, video_id))
+    else:
+        storage.delete_prefix(storage.frame_prefix(uid, video_id))
     if row.get("storage_key"):
         storage.delete_key(row["storage_key"])
     db.delete_video(video_id)

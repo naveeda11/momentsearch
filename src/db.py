@@ -39,7 +39,7 @@ def pool() -> ConnectionPool:
     return _pool
 
 
-def _run(fn: Callable[[Any], T]) -> T:
+def _run(fn: Callable[[Any], T], *, retry: bool = True) -> T:
     """Run `fn(conn)` on a pooled connection; one retry on a dead connection.
 
     Every statement in this module is idempotent (upserts, absolute UPDATEs,
@@ -49,6 +49,8 @@ def _run(fn: Callable[[Any], T]) -> T:
         with pool().connection() as conn:
             return fn(conn)
     except OperationalError:
+        if not retry:
+            raise
         with pool().connection() as conn:  # pool discarded the broken conn
             return fn(conn)
 
@@ -153,10 +155,13 @@ def set_progress(video_id: str, progress: float) -> None:
 
 
 def bump_attempts(video_id: str) -> int:
+    # Incrementing is not idempotent: if the server committed but the response
+    # was lost, retrying here could count one flow twice and dead-letter a valid
+    # source early. Surface the ambiguous connection failure instead.
     row = _run(lambda conn: conn.execute(
         "UPDATE ms_videos SET attempts = attempts + 1, updated_at = now() WHERE id = %s RETURNING attempts",
         (video_id,),
-    ).fetchone())
+    ).fetchone(), retry=False)
     return row["attempts"] if row else 0
 
 

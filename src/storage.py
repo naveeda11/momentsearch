@@ -61,6 +61,11 @@ def doc_key(user_id: str, doc_id: str, ext: str) -> str:
     return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}{ext}"
 
 
+def doc_render_key(user_id: str, doc_id: str) -> str:
+    """PDF rendering of a PPTX, used for exact slide previews/deep links."""
+    return f"{DOC_KEY_PREFIX}{user_id}/{doc_id}.rendered.pdf"
+
+
 def page_key(user_id: str, doc_id: str, page: int) -> str:
     return f"{PAGE_KEY_PREFIX}{user_id}/{doc_id}/{page:06d}.jpg"
 

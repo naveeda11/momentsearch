@@ -135,8 +135,7 @@ def _media_url(video: dict | None, user_id: str, video_id: str) -> str | None:
 
 
 def _page_thumb_url(user_id: str, doc_id: str, page: int) -> str | None:
-    """Page/slide render URL. PDF pages always have renders; PPTX slides only
-    when they embed a picture — so check existence rather than serve a 404."""
+    """Page/slide render URL. Check existence rather than serve a stale 404."""
     key = storage.page_key(user_id, doc_id, page)
     try:
         if not storage.exists(key):
@@ -148,12 +147,20 @@ def _page_thumb_url(user_id: str, doc_id: str, page: int) -> str | None:
     return f"/api/page/{doc_id}/{page:06d}.jpg?u={user_id}"
 
 
-def _doc_deeplink(meta: dict | None, doc_id: str, loc_type: str, loc_n: int) -> str:
+def _doc_deeplink(meta: dict | None, user_id: str, doc_id: str,
+                  loc_type: str, loc_n: int) -> str:
     """Deep link into the document. Browsers' PDF viewers honor #page=N; for a
-    source URL (e.g. arxiv) link there, else serve our stored copy."""
-    if meta and meta.get("url"):
+    source URL (e.g. arxiv) link there. PPTX decks use the converted PDF so the
+    cited slide is actually addressable."""
+    raw_key = (meta or {}).get("storage_key") or ""
+    is_pptx = raw_key.lower().endswith(".pptx")
+    if meta and meta.get("url") and not is_pptx:
         return f"{meta['url']}#page={loc_n}"
-    return f"/api/doc/{doc_id}#page={loc_n}"
+    key = storage.doc_render_key(user_id, doc_id) if is_pptx else raw_key
+    if key and storage.presign_capable():
+        return f"{storage.presign_get(key)}#page={loc_n}"
+    converted = "?converted=1" if is_pptx else ""
+    return f"/api/doc/{doc_id}{converted}#page={loc_n}"
 
 
 def retrieve(question: str, user_id: str, *, top_k: int | None = None,
@@ -251,7 +258,7 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
                 "locator_label": f"p. {loc_n}" if loc_type == "page" else f"slide {loc_n}",
                 "text": (tx or {}).get("text") or f"{loc_type} {loc_n} of {title}",
                 "thumbnail": _page_thumb_url(user_id, vid, loc_n),
-                "deeplink": _doc_deeplink(meta, vid, loc_type, loc_n),
+                "deeplink": _doc_deeplink(meta, user_id, vid, loc_type, loc_n),
             })
         else:
             # Video moment: anchor on the frame's exact timestamp when there is

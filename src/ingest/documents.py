@@ -15,10 +15,11 @@ pages that already have captions.
 """
 from __future__ import annotations
 
-import io
 import json
+import subprocess
+import tempfile
 import urllib.request
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from .. import config, storage
@@ -130,54 +131,62 @@ def parse_pdf(path: Path) -> tuple[list[PageRec], list[bytes]]:
     return pages, renders
 
 
-def parse_pptx(path: Path) -> tuple[list[PageRec], list[bytes | None]]:
-    """Per-slide text (shapes + speaker notes). python-pptx cannot rasterize a
-    slide, so the 'render' for an image-heavy slide is its largest embedded
-    picture (caption input + citation thumbnail); text slides get None."""
+def rendered_pptx_path(path: Path) -> Path:
+    return path.with_suffix(".rendered.pdf")
+
+
+def convert_pptx_to_pdf(path: Path) -> Path:
+    """Render a PPTX with LibreOffice, preserving complete slide appearance."""
+    out = rendered_pptx_path(path)
+    generated = path.with_suffix(".pdf")
+    out.unlink(missing_ok=True)
+    generated.unlink(missing_ok=True)
+    # LibreOffice otherwise shares one user profile across concurrent flows and
+    # one conversion can fail because another process holds the profile lock.
+    with tempfile.TemporaryDirectory(prefix="momentsearch-lo-") as profile:
+        proc = subprocess.run(
+            ["libreoffice", f"-env:UserInstallation={Path(profile).as_uri()}",
+             "--headless", "--convert-to", "pdf",
+             "--outdir", str(path.parent), str(path)],
+            capture_output=True, text=True, timeout=300,
+        )
+    if proc.returncode != 0 or not generated.exists():
+        detail = (proc.stderr or proc.stdout or "no converter output").strip()
+        raise RuntimeError(f"LibreOffice PPTX conversion failed: {detail[:300]}")
+    generated.replace(out)
+    return out
+
+
+def parse_pptx(path: Path) -> tuple[list[PageRec], list[bytes]]:
+    """Per-slide text + notes, paired with full-slide JPEG renders.
+
+    python-pptx extracts semantic text and speaker notes; LibreOffice renders
+    shapes, charts, grouped objects, and backgrounds that python-pptx cannot.
+    """
     from pptx import Presentation
 
     pages: list[PageRec] = []
-    renders: list[bytes | None] = []
     prs = Presentation(str(path))
     for i, slide in enumerate(list(prs.slides)[:config.DOC_MAX_PAGES]):
         parts: list[str] = []
-        biggest: bytes | None = None
-        biggest_size = 0
         for shape in slide.shapes:
             if shape.has_text_frame:
                 t = shape.text_frame.text.strip()
                 if t:
                     parts.append(t)
-            if shape.shape_type == 13:  # PICTURE
-                try:
-                    blob = shape.image.blob
-                    if len(blob) > biggest_size:
-                        biggest, biggest_size = blob, len(blob)
-                except Exception:
-                    pass
         if slide.has_notes_slide:
             notes = slide.notes_slide.notes_text_frame.text.strip()
             if notes:
                 parts.append(f"Speaker notes: {notes}")
         text = "\n".join(parts).strip()
-        renders.append(_to_jpeg(biggest) if biggest else None)
         pages.append(PageRec(page=i + 1, text=text,
                              needs_caption=len(text) < config.CAPTION_MIN_TEXT_CHARS))
+    rendered_pages, renders = parse_pdf(convert_pptx_to_pdf(path))
+    if len(rendered_pages) != len(pages):
+        raise RuntimeError(
+            f"PPTX render count mismatch: {len(pages)} slides, "
+            f"{len(rendered_pages)} rendered pages")
     return pages, renders
-
-
-def _to_jpeg(blob: bytes) -> bytes | None:
-    """Normalize an embedded picture (png/emf/...) to JPEG; None if unreadable."""
-    from PIL import Image
-
-    try:
-        img = Image.open(io.BytesIO(blob))
-        img.thumbnail((config.PAGE_RENDER_WIDTH, config.PAGE_RENDER_WIDTH * 2))
-        buf = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG", quality=80)
-        return buf.getvalue()
-    except Exception:
-        return None
 
 
 def parse_document(path: Path):

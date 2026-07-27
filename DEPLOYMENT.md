@@ -92,9 +92,11 @@ cookies as a base64 secret (there's no `./data` mount on Fly, so the file path
 won't work there — the worker decodes the secret to a temp file at runtime):
 
 ```powershell
-# import .env (skip FLY_ and the local cookie FILE path)
+# Import .env, but never import CLIP_SERVICE_URL. It is process-to-process
+# wiring defined in fly.toml, not a secret; even an empty secret overrides the
+# Fly config and forces embedding models into the 2 GB worker process.
 Get-Content .env |
-  Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^FLY_' -and $_ -notmatch '^YT_COOKIES_FILE=' } |
+  Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^(FLY_|CLIP_SERVICE_URL=|YT_COOKIES_FILE=)' } |
   fly secrets import
 
 # YouTube cookies as a secret (needed because Fly's datacenter IP is bot-checked)

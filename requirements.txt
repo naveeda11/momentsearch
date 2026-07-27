@@ -32,5 +32,5 @@ openai>=1.30
 
 # Document ingestion (Assignment 3: papers + decks)
 pymupdf>=1.24          # PDF text extraction + page renders
-python-pptx>=0.6.23    # PPTX slide text + speaker notes + embedded pictures
+python-pptx>=0.6.23    # PPTX text + notes; LibreOffice in Docker renders full slides
 redis>=5              # stretch: QUEUE_BACKEND=redis self-hosted broker

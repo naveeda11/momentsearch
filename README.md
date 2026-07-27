@@ -428,7 +428,7 @@ and `clip` (each on its own machine size, each scaled by its own bottleneck; the
 ```powershell
 fly launch --no-deploy --copy-config          # create the app (once)
 fly storage create                            # Tigris bucket; injects AWS_* secrets
-Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^FLY_' } | fly secrets import
+Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^(FLY_|CLIP_SERVICE_URL=)' } | fly secrets import
 fly secrets set STORAGE_PROVIDER=flyio
 fly deploy --ha=false                         # build image, start api/worker/clip
 fly scale count worker=2                      # more ingest throughput, anytime
