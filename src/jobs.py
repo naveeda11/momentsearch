@@ -13,6 +13,7 @@ from __future__ import annotations
 from prefect.deployments import run_deployment
 
 INGEST_DEPLOYMENT = "ms-ingest-video/ingest"
+DOC_DEPLOYMENT = "ms-ingest-document/ingest-doc"
 
 
 def enqueue_video(video_id: str, user_id: str) -> str:
@@ -24,3 +25,27 @@ def enqueue_video(video_id: str, user_id: str) -> str:
         flow_run_name=f"ingest-{video_id}",
     )
     return str(flow_run.id)
+
+
+def enqueue_document(doc_id: str, user_id: str, kind: str) -> str:
+    """Schedule the document ingest flow (papers/decks). Same fire-and-forget."""
+    flow_run = run_deployment(
+        name=DOC_DEPLOYMENT,
+        parameters={"doc_id": doc_id, "user_id": user_id, "kind": kind},
+        timeout=0,
+        flow_run_name=f"ingest-{doc_id}",
+    )
+    return str(flow_run.id)
+
+
+def enqueue_source(row: dict) -> str:
+    """Route a manifest row to the right queue backend and flow."""
+    from .config import QUEUE_BACKEND
+
+    if QUEUE_BACKEND == "redis":
+        from . import broker
+        return broker.enqueue(row)
+    kind = row.get("kind") or "video"
+    if kind == "video":
+        return enqueue_video(row["id"], row["user_id"])
+    return enqueue_document(row["id"], row["user_id"], kind)

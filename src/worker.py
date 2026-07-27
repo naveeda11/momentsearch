@@ -17,7 +17,11 @@ Embedding goes to the warm CLIP service when CLIP_SERVICE_URL is set
 import os
 import time
 
+from prefect import serve
+from prefect.deployments.runner import EntrypointType
+
 from .db import init_schema
+from .ingest.doc_pipeline import ingest_document
 from .ingest.pipeline import ingest_video
 
 
@@ -25,6 +29,7 @@ def main():
     init_schema()  # make sure migrations ran before consuming runs
     from .rag import vector_store
     vector_store.ensure_collection()  # up front, not mid-first-ingest
+    vector_store.ensure_text_collection()  # docs index here even without transcripts
     # Fair scheduler (WFQ): admits pending videos round-robin across users so
     # one bulk uploader can't starve everyone else (src/dispatcher.py).
     from . import dispatcher
@@ -35,8 +40,17 @@ def main():
     # retry forever so a blip pauses ingest instead of killing the worker.
     while True:
         try:
-            print(f"[worker] serving deployment 'ms-ingest-video/ingest' (concurrency {limit})")
-            ingest_video.serve(name="ingest", limit=limit)
+            print(f"[worker] serving 'ms-ingest-video/ingest' + "
+                  f"'ms-ingest-document/ingest-doc' (concurrency {limit})")
+            # MODULE_PATH: the runner re-imports each flow as src.ingest.<mod>
+            # (a real package import), so the modules' relative imports work.
+            # The default FILE_PATH executes the file as a loose script, where
+            # `from .. import db` dies with "beyond top-level package".
+            serve(ingest_video.to_deployment(
+                      name="ingest", entrypoint_type=EntrypointType.MODULE_PATH),
+                  ingest_document.to_deployment(
+                      name="ingest-doc", entrypoint_type=EntrypointType.MODULE_PATH),
+                  limit=limit)
             break  # clean shutdown
         except KeyboardInterrupt:
             break

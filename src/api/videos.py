@@ -151,8 +151,9 @@ def register(req: RegisterRequest, uid: str = Depends(user_id)):
 
 # ── Status / lifecycle ─────────────────────────────────────────────────────────
 
-_PUBLIC_FIELDS = ("id", "source", "url", "title", "status", "error",
-                  "frame_count", "progress", "attempts", "created_at", "updated_at")
+_PUBLIC_FIELDS = ("id", "source", "kind", "url", "title", "status", "error",
+                  "frame_count", "chunk_count", "page_count", "progress",
+                  "attempts", "created_at", "updated_at")
 
 
 def _public(row: dict) -> dict:

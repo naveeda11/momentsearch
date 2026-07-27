@@ -37,3 +37,9 @@ MULTIMODAL_RETRIEVAL.md
 .idea/
 .vscode/
 *.log
+
+# Media / document artifacts (never commit source files)
+*.pdf
+*.pptx
+*.mp4
+*.webm

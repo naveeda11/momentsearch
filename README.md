@@ -29,6 +29,30 @@ there.
 - 🧩 **Multimodal fusion** — for YouTube, a transcript branch runs alongside the visual one and a **rank-based scoring module** (RRF + time-windows + cross-modal boost) fuses them; "find where they *talk about* X" works even when the screen doesn't show it
 - 🔓 **Apache 2.0**
 
+## Assignment 3 fork: papers + decks (multi-source knowledge engine)
+
+This fork extends MomentSearch beyond video for **FDE Assignment 3 — Moment Search at Scale**.
+It ingests **research papers (PDF)** and **slide decks (PDF/PPTX)** through the same async queue, indexes them into the **same** Qdrant text collection as video transcripts, and answers one question with citations across every source kind.
+A video cites a **timestamp**, a paper cites a **page**, a deck cites a **slide** — each locator is stored in the chunk's payload at ingest time, so the LLM can never invent one.
+
+What was added, briefly:
+
+- `POST /api/documents` + `GET /api/sources` (and grader-contract aliases `POST /admin/documents`, `GET /admin/sources`, `POST /admin/videos`).
+- SSE `GET /ask_stream` — streams trace, citations, then the answer; retrieval-grounded by default, `?llm=1` for full LLM synthesis (the UI uses it).
+- A second Prefect flow `ms-ingest-document`: fetch → parse (pymupdf / python-pptx, page renders) → enrich (vision-LLM captions for image-only pages) → chunk (page/slide-aware) → embed + index, with per-task retries and crash-safe status ordering (`indexed` only after the last acknowledged upsert).
+- Locator-aware fusion: video moments merge by 15-second time windows, document chunks merge by exact page/slide (they all share t=0, so time-windowing would have collapsed a whole paper into one citation).
+- A reconciler in the dispatcher: rows stranded in-flight by a hard-killed worker are swept back to `pending` (checkpointed stages are not re-done) or dead-lettered to `failed` after `MAX_INGEST_ATTEMPTS`.
+- UI: register papers/decks, kind badges, page/slide citation cards, a page-render viewer with "Open PDF at p. N" deep links.
+
+### How I ran it
+
+- **Providers:** OpenAI `gpt-4o-mini` (answers + vision captions), fastembed `bge-small-en-v1.5` (text), CLIP `ViT-B-32` (frames). Managed state: Neon Postgres, Qdrant Cloud, Prefect Cloud, Tigris (deployed) / local disk (dev).
+- **Local:** `cp .env.example .env`, fill it in, then `docker compose up --build`. The API listens on 8000 and 8100 (the assignment graders default to `BASE_URL=http://localhost:8100`).
+- **Benchmark:** from the assignment folder, `BASE_URL=http://localhost:8100 ADMIN_TOKEN=... python benchmark/bench.py` (and `--resilience` for the worker-kill no-loss proof). The passing run used `DISPATCH_MAX_INFLIGHT=6 docker compose up -d --scale worker=3`; all five SLAs green (ratio 1.1x, 10.3 chunks/s, accept p95 233ms, recall@10 0.87, 0% errors).
+- **Read-path isolation (the decoupling story):** search embeds queries on a dedicated `clip-query` service, and compose pins it (with the api) to its own CPU cores with high cpu_shares. Before that split, a full-parallel backfill pushed search p95 to 14x idle through a shared model lock; after it, 1.1x. Deployed on Fly, the same isolation falls out of separate VMs per process group.
+- **Tests:** `python -m pytest tests` (fusion bucketing, page-boundary chunking, PDF parsing).
+- **Deployed:** Fly.io from the single image (`fly deploy`, worker count 2); the public UI answers cross-source.
+
 ## Architecture
 
 The design rule: **stateful = rented managed service, stateless = this repo's

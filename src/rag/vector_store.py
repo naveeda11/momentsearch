@@ -78,13 +78,16 @@ def point_id(video_id: str, frame_idx: int) -> str:
 
 
 def _user_filter(user_id: str, video_id: str | None = None,
-                 video_ids: list[str] | None = None) -> qm.Filter:
+                 video_ids: list[str] | None = None,
+                 kinds: list[str] | None = None) -> qm.Filter:
     must: list[qm.FieldCondition] = [
         qm.FieldCondition(key="user_id", match=qm.MatchValue(value=user_id))]
     if video_id:  # single-video scope (kept for /transcript-style calls)
         must.append(qm.FieldCondition(key="video_id", match=qm.MatchValue(value=video_id)))
     elif video_ids:  # multi-select scope — query only the chosen videos
         must.append(qm.FieldCondition(key="video_id", match=qm.MatchAny(any=video_ids)))
+    if kinds:  # kind-intent scope ("the slide about..." -> decks only)
+        must.append(qm.FieldCondition(key="kind", match=qm.MatchAny(any=kinds)))
     return qm.Filter(must=must)
 
 
@@ -121,6 +124,11 @@ def _ensure(collection: str, dim: int) -> None:
             pass
     try:
         c.create_payload_index(collection_name=collection, field_name="video_id",
+                               field_schema=qm.PayloadSchemaType.KEYWORD)
+    except Exception:
+        pass
+    try:  # kind (video|paper|deck) for kind-intent filtered search
+        c.create_payload_index(collection_name=collection, field_name="kind",
                                field_schema=qm.PayloadSchemaType.KEYWORD)
     except Exception:
         pass
@@ -178,8 +186,15 @@ def upsert_chunks(user_id: str, video_id: str, vectors: np.ndarray,
                   payloads: list[dict[str, Any]]) -> None:
     """Transcript chunks into the text collection. IDs are uuid5 of
     '<video_id>:text:<i>' so re-runs overwrite, and never collide with frame ids."""
+    upsert_chunks_at(user_id, video_id, vectors, payloads, offset=0)
+
+
+def upsert_chunks_at(user_id: str, video_id: str, vectors: np.ndarray,
+                     payloads: list[dict[str, Any]], *, offset: int) -> None:
+    """Batched variant: chunk i in this call gets global index offset+i, so a
+    multi-batch document keeps deterministic, collision-free point IDs."""
     points = [
-        qm.PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{video_id}:text:{i}")),
+        qm.PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_URL, f"{video_id}:text:{offset + i}")),
                        vector=vec.tolist(), payload=payload)
         for i, (vec, payload) in enumerate(zip(vectors, payloads))
     ]
@@ -189,13 +204,14 @@ def upsert_chunks(user_id: str, video_id: str, vectors: np.ndarray,
 
 def search_text(vector: np.ndarray, user_id: str, *, top_k: int,
                 video_id: str | None = None,
-                video_ids: list[str] | None = None) -> list[dict[str, Any]]:
+                video_ids: list[str] | None = None,
+                kinds: list[str] | None = None) -> list[dict[str, Any]]:
     try:
         hits = client().query_points(
             collection_name=TEXT_COLLECTION,
             query=vector.tolist(),
             limit=top_k,
-            query_filter=_user_filter(user_id, video_id, video_ids),
+            query_filter=_user_filter(user_id, video_id, video_ids, kinds),
             with_payload=True,
             search_params=qm.SearchParams(
                 quantization=qm.QuantizationSearchParams(rescore=True)

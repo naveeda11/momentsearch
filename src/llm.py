@@ -34,12 +34,14 @@ NVIDIA_BASE_URL = "https://integrate.api.nvidia.com/v1"
 PROVIDERS = ("openai", "nvidia", "anthropic")
 
 SYSTEM = (
-    "You answer a user's question about a video using the numbered moments "
-    "provided as your evidence. Each moment has a timestamp and may include a "
-    "video FRAME (what was shown on screen) and/or a TRANSCRIPT excerpt (what was "
-    "said out loud). Use BOTH kinds of evidence: for a question about what someone "
-    "SAID or talked about, read the transcript text; for a question about what is "
-    "SHOWN, read the frame.\n"
+    "You answer a user's question using the numbered moments provided as your "
+    "evidence. Sources are mixed: a moment can be a VIDEO moment (timestamp, "
+    "with a frame image and/or transcript excerpt), a PAPER passage (page "
+    "number, e.g. 'p. 4 of ...'), or a DECK slide ('slide 12 of ...'). Use "
+    "whatever evidence each moment carries: for a question about what someone "
+    "SAID or a document STATES, read the text; for what is SHOWN, read the "
+    "image. When helpful, say where evidence comes from in words (the talk, "
+    "the paper, the deck) — the [n] citation carries the exact spot.\n"
     "Rules:\n"
     "1. Read the question carefully and answer exactly what is asked. Start with a "
     "one-line direct answer, then explain in short paragraphs — ONE paragraph per "
@@ -96,10 +98,11 @@ def _intro(question: str, n: int) -> str:
     return (
         f"QUESTION: {question}\n\n"
         f"Answer this question using the {n} moments below (numbered 1 to {n}). "
-        "Each has a timestamp and a video frame and/or a transcript excerpt. If "
-        "the question is about what was said, use the transcript text. Give a "
-        "direct answer grounded in the relevant moment(s), cited as [n]. Only say "
-        "you couldn't find it if none of the moments are relevant."
+        "Each is a video moment, a paper page, or a deck slide, carrying an "
+        "image and/or a text excerpt. If the question is about what was said or "
+        "stated, use the text. Give a direct answer grounded in the relevant "
+        "moment(s), cited as [n]. Only say you couldn't find it if none of the "
+        "moments are relevant."
     )
 
 
@@ -126,6 +129,42 @@ def answer(question: str, moments: list[dict], cfg: LLMConfig) -> str:
     return _answer_openai(cfg, question, moments)
 
 
+_CAPTION_SYSTEM = (
+    "You describe one page or slide image so it can be found by text search. "
+    "Write 2-4 dense sentences naming what it shows: titles, chart types, axes, "
+    "trends, key numbers, diagram structure, and any legible text. No preamble, "
+    "no speculation beyond what is visible."
+)
+
+
+def caption_image(jpeg: bytes, cfg: LLMConfig, what: str = "page") -> str:
+    """Vision caption for an image-only page/slide (the enrich stage). Separate
+    from answer(): the citation SYSTEM prompt would leak [n] markers into text
+    that gets embedded."""
+    prompt = f"Describe this {what} for search indexing."
+    if cfg.provider == "anthropic":
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=cfg.api_key, base_url=cfg.base_url or None)
+        resp = client.messages.create(
+            model=cfg.model, max_tokens=300, system=_CAPTION_SYSTEM,
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": prompt},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                             "data": base64.b64encode(_downscale(jpeg)).decode()}}]}])
+        return "".join(b.text for b in resp.content if b.type == "text").strip()
+    from openai import OpenAI
+
+    client = OpenAI(api_key=cfg.api_key or "not-needed", base_url=_base_url(cfg))
+    uri = f"data:image/jpeg;base64,{base64.b64encode(_downscale(jpeg)).decode()}"
+    resp = client.chat.completions.create(
+        model=cfg.model, temperature=0.2, max_tokens=300,
+        messages=[{"role": "system", "content": _CAPTION_SYSTEM},
+                  {"role": "user", "content": [{"type": "text", "text": prompt},
+                                               {"type": "image_url", "image_url": {"url": uri}}]}])
+    return (resp.choices[0].message.content or "").strip()
+
+
 def ping(cfg: LLMConfig) -> str:
     """Connectivity + vision check: one tiny image, one word back. Raises with
     the provider's error on failure (surfaced to the settings UI)."""
@@ -146,11 +185,14 @@ def _base_url(cfg: LLMConfig) -> str | None:
 
 
 def _label(i: int, m: dict) -> str:
-    line = f"[{i}] @ {m.get('timestamp', '')}"
+    # Kind-aware label from the citation ("p. 4 of Title" / "slide 12 of ..."),
+    # falling back to the video timestamp form.
+    where = m.get("label") or f"@ {m.get('timestamp', '')}"
+    line = f"[{i}] {where}"
     if m.get("transcript"):
-        line += f' transcript: "{m["transcript"]}"'
+        line += f' text: "{m["transcript"]}"'
     if m.get("image") is None:
-        line += " (transcript only, no frame)"
+        line += " (text only, no image)"
     return line
 
 

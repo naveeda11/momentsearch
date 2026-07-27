@@ -82,6 +82,7 @@
       <div id="addTabs" class="flex gap-2">
         <span class="tab active" data-tab="yt">YouTube URL</span>
         <span class="tab" data-tab="up">Upload</span>
+        <span class="tab" data-tab="doc">Paper / Deck</span>
       </div>
     </div>
     <div id="addControls">
@@ -93,6 +94,17 @@
       <div id="tab-up" class="hidden flex gap-2 flex-wrap items-center">
         <input id="upFile" type="file" accept="video/*" class="flex-1 min-w-[220px] text-sm">
         <button id="upBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Upload &amp; ingest</button>
+      </div>
+      <div id="tab-doc" class="hidden flex gap-2 flex-wrap items-center">
+        <select id="docKind" class="bg-white border border-line rounded-xl px-3 py-2.5 text-sm outline-none focus:border-coral">
+          <option value="paper">Paper (PDF)</option>
+          <option value="deck">Deck (PDF/PPTX)</option>
+        </select>
+        <input id="docUri" type="text" placeholder="https://arxiv.org/pdf/…  or a public PDF/PPTX URL"
+          class="flex-1 min-w-[220px] bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-coral">
+        <input id="docTitle" type="text" placeholder="Title (optional)"
+          class="w-44 bg-white border border-line rounded-xl px-4 py-2.5 text-sm outline-none focus:border-coral">
+        <button id="docBtn" class="bg-ink hover:bg-black text-white text-sm font-semibold rounded-xl px-5 py-2.5">Ingest</button>
       </div>
       <div id="ingestStatus" class="text-sm text-muted mt-3 min-h-[20px]"></div>
     </div>
@@ -154,8 +166,8 @@ function applyMode(){
     $("#heroTitle").innerHTML='Ask your videos <span class="text-coral">anything</span> you can see.';
     $("#heroSub").textContent='Add a YouTube URL or upload a file. MomentSearch finds the exact moments — and plays each one right beside the answer.';
     $("#modeLink").textContent='← Back to the sample';     $("#modeLink").href='/';
-    $("#libTitle").textContent='Your videos';
-    $("#libNote").innerHTML='YouTube videos are searched by <b>both</b> what\'s shown (frames) and what\'s said (transcript). Uploaded files are searched by picture only for now — no transcript yet. Tip: unselect the samples to search only your own uploads.';
+    $("#libTitle").textContent='Your sources';
+    $("#libNote").innerHTML='One index, three source types: YouTube videos are searched by what\'s shown <b>and</b> said; papers cite the exact <b>page</b>; decks cite the exact <b>slide</b>. Image-heavy pages are captioned by the vision LLM. Tip: unselect the samples to search only your own sources.';
   } else {
     $("#heroBadge").innerHTML='● Sample project · four LLM talks, pre-indexed';
     $("#heroTitle").innerHTML='A Deep Dive into <span class="text-coral">LLMs</span>.';
@@ -213,16 +225,22 @@ async function loadVideos(){
   indexedIds.forEach(id=>{ if(!KNOWN.has(id)){ KNOWN.add(id); SELECTED.add(id); }});
   [...KNOWN].forEach(id=>{ if(!indexedIds.has(id)){ KNOWN.delete(id); SELECTED.delete(id); }});
 
-  const srcLabel=v=>v.is_sample?"sample":(v.source==="youtube"?"YouTube":"upload");
+  const kindTag=v=>v.kind==="paper"?"📄 paper":(v.kind==="deck"?"🖼 deck":null);
+  const srcLabel=v=>kindTag(v)||(v.is_sample?"sample":(v.source==="youtube"?"YouTube":"upload"));
   const pct=v=>v.progress?` ${Math.round(v.progress*100)}%`:"";
-  // A leading status indicator so each video's state is obvious at a glance.
+  // A leading status indicator so each source's state is obvious at a glance.
   function badge(v){
+    const done = v.kind==="paper"||v.kind==="deck"
+      ? `${v.chunk_count||0} chunks · ${srcLabel(v)}`
+      : `${v.frame_count||0}f · ${srcLabel(v)}`;
     switch(v.status){
-      case "indexed":   return {icon:"✓", label:`${v.frame_count||0}f · ${srcLabel(v)}`, c:"text-[#1f7a43]"};
+      case "indexed":   return {icon:"✓", label:done,               c:"text-[#1f7a43]"};
       case "pending":   return {icon:"◷", label:"waiting (fair queue)", c:"text-[#8a6d1a]"};
       case "queued":    return {icon:"◷", label:"queued",           c:"text-[#8a6d1a]"};
-      case "fetching":  return {icon:"⏬", label:"fetching video…",  c:"text-[#8a6d1a]"};
+      case "fetching":  return {icon:"⏬", label:"fetching…",        c:"text-[#8a6d1a]"};
       case "sampling":  return {icon:"⏳", label:"sampling"+pct(v),  c:"text-[#8a6d1a]"};
+      case "parsing":   return {icon:"⏳", label:"parsing"+pct(v),   c:"text-[#8a6d1a]"};
+      case "enriching": return {icon:"✨", label:"captioning"+pct(v),c:"text-[#8a6d1a]"};
       case "embedding": return {icon:"⏳", label:"embedding"+pct(v), c:"text-[#8a6d1a]"};
       case "failed":    return {icon:"⚠", label:"failed",           c:"text-coral2"};
       case "skipped":   return {icon:"⊘", label:"duplicate",        c:"text-muted"};
@@ -287,6 +305,7 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active")); t.classList.add("active");
   $("#tab-yt").classList.toggle("hidden",t.dataset.tab!=="yt");
   $("#tab-up").classList.toggle("hidden",t.dataset.tab!=="up");
+  $("#tab-doc").classList.toggle("hidden",t.dataset.tab!=="doc");
 });
 
 /* Ingestion is a QUEUE — register returns 202 instantly and the worker(s)
@@ -294,7 +313,7 @@ document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
    queued (you can add more right away) and let a single background refresher
    update the chips until nothing is processing. Per-video progress shows on
    the chips themselves (sampling… / embedding 40%). */
-const _INFLIGHT=["pending","queued","fetching","sampling","embedding"];
+const _INFLIGHT=["pending","queued","fetching","sampling","parsing","enriching","embedding"];
 let _refresher=null;
 function startRefresher(){
   if(_refresher) return;
@@ -321,6 +340,21 @@ async function registerIngest(body, btns){
 $("#ytBtn").onclick=()=>{ const u=$("#ytUrl").value.trim(); if(!u)return;
   $("#ytBtn").disabled=true; $("#ytUrl").value="";   // clear so the field is ready for the next URL
   registerIngest({url:u},[$("#ytBtn")]); };
+$("#docBtn").onclick=async()=>{
+  const uri=$("#docUri").value.trim(); if(!uri)return;
+  const st=$("#ingestStatus"); $("#docBtn").disabled=true;
+  try{
+    const resp=await fetch("/api/documents",{method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({uri, kind:$("#docKind").value,
+                           title:$("#docTitle").value.trim()||null})});
+    if(!resp.ok){ const e=await resp.json().catch(()=>({})); throw new Error(e.detail||resp.statusText); }
+    $("#docUri").value=""; $("#docTitle").value="";
+    st.textContent="Queued — parsing happens in the background. Add another anytime.";
+    loadVideos(); startRefresher();
+  }catch(e){ st.textContent="Error: "+e.message; }
+  finally{ $("#docBtn").disabled=false; }
+};
 $("#upBtn").onclick=async()=>{ const f=$("#upFile").files[0]; if(!f)return;
   const st=$("#ingestStatus"); $("#upBtn").disabled=true;
   try{
@@ -351,41 +385,64 @@ $("#go").onclick=async()=>{
   try{
     // Front page (/) queries ONLY the samples; /get-started queries the selected set.
     const video_ids = SELECTABLE() ? [...SELECTED] : SAMPLE_INDEXED;
-    const r=await (await fetch("/api/ask",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({question:q, video_ids})})).json();
-    CITES=r.citations||[];
-    let html="";
-    if(r.answer) html+=`<div class="prose-body fade-in">${renderMarkdown(r.answer)}</div>`;
-    if(r.note) html+=`<p class="text-xs text-muted mt-3">${esc(r.note)}</p>`;
-    if(!r.answer && !CITES.length) html=`<p class="text-muted">No matching moments. Add a video first.</p>`;
-    $("#article").innerHTML=html;
-    renderSources();
+    // SSE stream: citations render the moment retrieval finishes; the LLM
+    // answer replaces the shimmer when synthesis lands (llm=1 = full answer).
+    const params=new URLSearchParams({q, llm:"1"});
+    if(video_ids.length) params.set("video_ids", video_ids.join(","));
+    const resp=await fetch("/ask_stream?"+params.toString());
+    if(!resp.ok) throw new Error(resp.statusText);
+    const reader=resp.body.getReader(); const dec=new TextDecoder();
+    let buf="", gotAnswer=false;
+    for(;;){
+      const {done,value}=await reader.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true});
+      let idx;
+      while((idx=buf.indexOf("\n\n"))>=0){
+        const line=buf.slice(0,idx).trim(); buf=buf.slice(idx+2);
+        if(!line.startsWith("data:")) continue;
+        const d=JSON.parse(line.slice(5));
+        if(d.citations){ CITES=d.citations; renderSources(); }
+        if(d.answer!==undefined){
+          gotAnswer=true;
+          let html=`<div class="prose-body fade-in">${renderMarkdown(d.answer)}</div>`;
+          if(d.note) html+=`<p class="text-xs text-muted mt-3">${esc(d.note)}</p>`;
+          $("#article").innerHTML=html;
+        }
+      }
+    }
+    if(!gotAnswer && !CITES.length)
+      $("#article").innerHTML=`<p class="text-muted">No matching moments. Add a source first.</p>`;
   }catch(e){ $("#article").innerHTML=`<p class="text-coral2">Error: ${esc(e.message)}</p>`; }
   finally{ $("#go").disabled=false; $("#go").textContent="→"; }
 };
 
+const KIND_TAG={
+  paper:'<span class="text-[9px] px-1 rounded bg-[#dbe7fb] text-[#2456a6]">📄 paper</span>',
+  deck: '<span class="text-[9px] px-1 rounded bg-[#f3e2fb] text-[#7a2ea6]">🖼 deck</span>'};
 function renderSources(){
   $("#sources").innerHTML=CITES.map(c=>{
+    const isDoc=c.kind==="paper"||c.kind==="deck";
     const mods=(c.modalities||[]);
-    const tags=mods.map(m=>m==="frame"
+    const tags=(KIND_TAG[c.kind]||"")+" "+(isDoc?"":mods.map(m=>m==="frame"
       ? '<span class="text-[9px] px-1 rounded bg-coral/15 text-coral2">seen</span>'
-      : '<span class="text-[9px] px-1 rounded bg-[#cfe8d6] text-[#1f7a43]">said</span>').join(" ");
-    // Text-only moments have no frame; they're always YouTube, so fall back to
-    // the video's thumbnail instead of an empty "(no frame)" placeholder.
-    const yid = ytId(c);
+      : '<span class="text-[9px] px-1 rounded bg-[#cfe8d6] text-[#1f7a43]">said</span>').join(" "));
+    // Video text-only moments fall back to the YouTube thumbnail; documents
+    // show their page/slide render, or a paper glyph when there is none.
+    const yid = isDoc?null:ytId(c);
     const img = c.thumbnail || (yid ? `https://img.youtube.com/vi/${yid}/hqdefault.jpg` : null);
     const thumb = img
       ? `<img loading="lazy" src="${esc(img)}" class="w-full h-full object-cover" onerror="this.style.opacity=0">`
-      : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">transcript moment<br>(no frame)</div>`;
-    const quote = c.transcript
-      ? `<div class="text-[11px] text-muted italic mt-1 line-clamp-2">“${esc(c.transcript)}”</div>` : "";
+      : `<div class="w-full h-full flex items-center justify-center text-muted text-xs p-2 text-center">${isDoc?(c.kind==="paper"?"📄":"🖼")+"<br>"+esc(c.locator_label||""):"transcript moment<br>(no frame)"}</div>`;
+    const quoteSrc = c.transcript||c.text;
+    const quote = quoteSrc
+      ? `<div class="text-[11px] text-muted italic mt-1 line-clamp-2">“${esc(quoteSrc)}”</div>` : "";
     return `
     <button class="source text-left bg-card border border-line rounded-2xl overflow-hidden shadow-sm hover:border-coral transition" data-n="${c.n}">
       <div class="aspect-video bg-paper2 overflow-hidden">${thumb}</div>
       <div class="p-3">
         <div class="flex items-center gap-2 mb-1">
           <span class="text-[10px] font-bold text-white bg-coral rounded px-1.5 py-0.5">${c.n}</span>
-          <span class="text-[11px] text-muted">${esc(c.timestamp)}</span>
+          <span class="text-[11px] text-muted">${esc(c.locator_label||c.timestamp||"")}</span>
           ${tags}
           <span class="text-[11px] text-muted ml-auto">score ${c.score}</span>
         </div>
@@ -401,6 +458,24 @@ function ytId(c){ if(c.video_id&&c.video_id.startsWith("yt_")) return c.video_id
   const m=(c.url||"").match(/(?:youtu\.be\/|v=)([\w-]{11})/); return m?m[1]:null; }
 function playCitation(n){
   const c=CITES.find(x=>x.n===n); if(!c)return;
+  // Documents: show the page/slide itself, deep-link out to the exact page.
+  if(c.kind==="paper"||c.kind==="deck"){
+    $("#mTitle").textContent=c.title||c.video_id;
+    $("#mMeta").textContent=c.locator_label||"";
+    const box=$("#playerBox");
+    box.innerHTML=c.thumbnail
+      ? `<img src="${esc(c.thumbnail)}" class="w-full h-full object-contain bg-white" alt="${esc(c.locator_label||'page')}">`
+      : `<div class="w-full h-full flex items-center justify-center text-white/80 text-sm p-6 text-center">No render for this ${c.kind==="deck"?"slide":"page"} — open the source to view it.</div>`;
+    $("#mFrame").style.display = c.thumbnail ? "" : "none";
+    if(c.thumbnail) $("#mFrame").src=c.thumbnail;
+    $("#mFrameLabel").textContent = c.kind==="paper" ? `Matched ${c.locator_label}` : `Matched ${c.locator_label}`;
+    $("#mFrameDesc").textContent = `This ${c.kind==="deck"?"slide":"page"} matched your question. `+
+      (c.text?`“${c.text.slice(0,140)}${c.text.length>140?"…":""}”`:"");
+    const out=$("#mOut"); out.href=c.deeplink||"#";
+    out.textContent=(c.kind==="paper"?`Open PDF at ${c.locator_label} ↗`:`Open deck at ${c.locator_label} ↗`);
+    $("#modal").classList.remove("hidden"); document.body.style.overflow="hidden";
+    return;
+  }
   const secs=Math.floor((c.ms||0)/1000);
   $("#mTitle").textContent=c.title||c.video_id;
   $("#mMeta").textContent = c.transcript ? `“${c.transcript}”` : `Moment at ${c.timestamp}`;
@@ -435,7 +510,7 @@ $("#article").addEventListener("click",e=>{ const c=e.target.closest(".cite"); i
 
 /* examples */
 const EXAMPLES=["a diagram of the attention mechanism","an animation of a neural network",
-  "a slide listing examples of large language models","a person speaking on stage next to slides"];
+  "what does the survey say about hybrid retrieval","the slide about word vectors"];
 $("#examples").innerHTML=EXAMPLES.map(q=>`<span class="chip">${esc(q)}</span>`).join("");
 $("#examples").querySelectorAll(".chip").forEach(c=>c.onclick=()=>{ qEl.value=c.textContent; autogrow(); qEl.focus(); });
 

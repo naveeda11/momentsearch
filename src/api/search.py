@@ -7,6 +7,7 @@ playback stream via presigned URLs and never touch this process.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -148,6 +149,31 @@ def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
                           video_ids=video_ids)
 
 
+# ── Streamed ask (SSE) — the Assignment 3 read-path contract ─────────────────
+
+@router.get("/ask_stream")
+def ask_stream(q: str, top_k: int | None = None, llm: int = 0,
+               video_ids: str | None = None,
+               x_user_id: str | None = Header(default=None)):
+    """SSE stream: trace -> citations -> answer -> done, each as a `data:` JSON
+    line. Default answers extractively from retrieval (fast, our-system-only —
+    what the SLA gate measures); ?llm=1 (the UI/demo) adds full LLM synthesis
+    over the same citations."""
+    if not q.strip():
+        raise HTTPException(400, "Empty question.")
+    uid = _uid(x_user_id)
+    vids = [v for v in (video_ids or "").split(",") if v] or None
+
+    def gen():
+        for ev in rag_search.stream_events(q.strip(), uid, top_k=top_k,
+                                           video_ids=vids, use_llm=bool(llm)):
+            yield f"data: {json.dumps(ev, default=str)}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
+
+
 # ── Media (local-dev only; buckets serve these via presigned URLs) ───────────
 
 @router.get("/api/frame/{video_id}/{name}")
@@ -161,6 +187,38 @@ def frame(video_id: str, name: str, u: str | None = None):
         raise HTTPException(404, "Frame not found.")
     return FileResponse(fp, media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/api/page/{doc_id}/{name}")
+def page(doc_id: str, name: str, u: str | None = None):
+    """Page/slide render (local-dev; buckets presign these)."""
+    if storage.presign_capable():
+        raise HTTPException(404, "Page renders are served from object storage.")
+    if not _FRAME_RE.match(name):
+        raise HTTPException(404, "Page not found.")
+    fp = storage.local_path(f"{config.PAGE_KEY_PREFIX}{_uid(u)}/{doc_id}/{name}")
+    if not fp.exists():
+        raise HTTPException(404, "Page not found.")
+    return FileResponse(fp, media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
+@router.get("/api/doc/{doc_id}")
+def doc(doc_id: str, u: str | None = None):
+    """The stored original PDF/PPTX — correct content-type so a browser's PDF
+    viewer honors #page=N deeplinks (local-dev; buckets presign)."""
+    uid = _uid(u)
+    row = db.get_video(doc_id)
+    if row is None or row["user_id"] != uid or not row.get("storage_key"):
+        raise HTTPException(404, "Document not found.")
+    if storage.presign_capable():
+        raise HTTPException(404, "Documents are served from object storage.")
+    fp = storage.local_path(row["storage_key"])
+    if not fp.exists():
+        raise HTTPException(404, "Document file not found.")
+    media = ("application/pdf" if fp.suffix == ".pdf"
+             else config.ALLOWED_DOC_TYPES[1])
+    return FileResponse(fp, media_type=media)
 
 
 @router.get("/api/video/{video_id}")

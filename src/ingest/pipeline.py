@@ -45,7 +45,10 @@ def t_fetch(video_id: str, user_id: str) -> str:
     db.set_status(video_id, "fetching")
     row = db.get_video(video_id)
     if row is None:
-        raise ValueError(f"no manifest row for {video_id}")
+        # Row deleted between scheduling and execution — permanent; retrying
+        # would hold a worker slot for the full retry ladder doing nothing.
+        print(f"[fetch] {video_id}: manifest row deleted — nothing to ingest")
+        return ""
 
     if row["source"] == "youtube":
         path, title = fetch_mod.fetch_youtube(row["url"], video_id)
@@ -108,7 +111,7 @@ def t_embed_index(video_id: str, user_id: str, frames: list[Frame]) -> int:
             ids=range(start, start + len(batch)),
             vectors=vectors,
             payloads=[{"user_id": user_id, "video_id": video_id, "ms": f.ms,
-                       "idx": start + i, "modality": "frame",
+                       "idx": start + i, "modality": "frame", "kind": "video",
                        "t_start": f.ms / 1000.0, "t_end": f.ms / 1000.0,
                        "embed_version": EMBED_VERSION}
                       for i, f in enumerate(batch)],
@@ -144,7 +147,7 @@ def t_transcript(video_id: str, user_id: str) -> int:
         vecs = embed_docs([c["text"] for c in chunks])
         vector_store.upsert_chunks(user_id, video_id, vecs, payloads=[
             {"user_id": user_id, "video_id": video_id, "modality": "text",
-             "t_start": c["t_start"], "t_end": c["t_end"],
+             "kind": "video", "t_start": c["t_start"], "t_end": c["t_end"],
              "ms": int(c["t_start"] * 1000), "text": c["text"],
              "embed_version": TEXT_EMBED_VERSION} for c in chunks])
         print(f"[transcript] {video_id}: indexed {len(chunks)} transcript chunks")

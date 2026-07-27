@@ -7,8 +7,9 @@ pending -> fetching -> sampling -> embedding -> indexed | skipped | failed
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Callable, TypeVar
 
+from psycopg import OperationalError
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -17,6 +18,8 @@ from .config import DATABASE_URL, INFLIGHT_STATUSES
 _pool: ConnectionPool | None = None
 _pool_pid: int | None = None
 
+T = TypeVar("T")
+
 
 def pool() -> ConnectionPool:
     """Process-local pool. Prefect runs flows in subprocesses; a child must
@@ -24,14 +27,30 @@ def pool() -> ConnectionPool:
     fork gets a fresh pool."""
     global _pool, _pool_pid
     if _pool is None or _pool_pid != os.getpid():
-        # check= pings each connection before lending it out — Neon silently
-        # drops idle SSL connections, which otherwise 500s the first request
-        # after a quiet period.
+        # Neon silently drops idle SSL connections. Instead of a preflight
+        # check on EVERY checkout (which added ~200ms to each query and blew
+        # the 300ms accept-latency SLA), keep pooled connections younger than
+        # Neon's idle timeout (max_idle) and let _run() retry the rare stale
+        # one on a fresh connection.
         _pool = ConnectionPool(DATABASE_URL, min_size=1, max_size=5,
-                               check=ConnectionPool.check_connection,
+                               max_idle=120,
                                kwargs={"row_factory": dict_row})
         _pool_pid = os.getpid()
     return _pool
+
+
+def _run(fn: Callable[[Any], T]) -> T:
+    """Run `fn(conn)` on a pooled connection; one retry on a dead connection.
+
+    Every statement in this module is idempotent (upserts, absolute UPDATEs,
+    atomic claims), so a retry after a mid-statement drop is safe.
+    """
+    try:
+        with pool().connection() as conn:
+            return fn(conn)
+    except OperationalError:
+        with pool().connection() as conn:  # pool discarded the broken conn
+            return fn(conn)
 
 
 SCHEMA = """
@@ -56,6 +75,13 @@ CREATE INDEX IF NOT EXISTS ms_videos_user_idx   ON ms_videos (user_id, created_a
 CREATE INDEX IF NOT EXISTS ms_videos_status_idx ON ms_videos (status);
 CREATE INDEX IF NOT EXISTS ms_videos_hash_idx   ON ms_videos (user_id, source_hash);
 
+-- Multi-source columns (Assignment 3). No migration framework exists, so schema
+-- evolution is idempotent ALTERs executed alongside CREATE TABLE IF NOT EXISTS.
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS kind        TEXT NOT NULL DEFAULT 'video';  -- video | paper | deck
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS chunk_count INT;   -- text chunks indexed (throughput evidence)
+ALTER TABLE ms_videos ADD COLUMN IF NOT EXISTS page_count  INT;   -- pages/slides parsed
+CREATE INDEX IF NOT EXISTS ms_videos_stale_idx ON ms_videos (status, updated_at);
+
 -- Bring-your-own-model: a tenant's hosted LLM endpoint (vLLM / Ollama / any
 -- OpenAI-compatible server, NVIDIA NIM, or Anthropic). When a row exists the
 -- read path answers with THIS model instead of the server's LLM_* env config.
@@ -71,17 +97,16 @@ CREATE TABLE IF NOT EXISTS ms_user_llms (
 
 
 def init_schema() -> None:
-    with pool().connection() as conn:
-        conn.execute(SCHEMA)
+    _run(lambda conn: conn.execute(SCHEMA))
 
 
 def upsert_pending(video: dict[str, Any]) -> dict:
-    """Insert a video as pending; re-submitting an existing id resets it."""
-    with pool().connection() as conn:
-        row = conn.execute(
+    """Insert a source as pending; re-submitting an existing id resets it."""
+    video = {"kind": "video", **video}
+    row = _run(lambda conn: conn.execute(
             """
-            INSERT INTO ms_videos (id, user_id, source, url, storage_key, source_hash, title, status)
-            VALUES (%(id)s, %(user_id)s, %(source)s, %(url)s, %(storage_key)s,
+            INSERT INTO ms_videos (id, user_id, source, kind, url, storage_key, source_hash, title, status)
+            VALUES (%(id)s, %(user_id)s, %(source)s, %(kind)s, %(url)s, %(storage_key)s,
                     %(source_hash)s, %(title)s, 'pending')
             ON CONFLICT (id) DO UPDATE SET
                 url = COALESCE(EXCLUDED.url, ms_videos.url),
@@ -92,62 +117,64 @@ def upsert_pending(video: dict[str, Any]) -> dict:
             RETURNING *
             """,
             video,
-        ).fetchone()
+        ).fetchone())
     return row
 
 
 def set_status(video_id: str, status: str, *, error: str | None = None,
                title: str | None = None, frame_count: int | None = None,
                source_hash: str | None = None, embed_version: str | None = None,
-               progress: float | None = None) -> None:
-    with pool().connection() as conn:
-        conn.execute(
+               progress: float | None = None, chunk_count: int | None = None,
+               page_count: int | None = None,
+               storage_key: str | None = None) -> None:
+    _run(lambda conn: conn.execute(
             """
             UPDATE ms_videos SET status = %s, error = %s,
                 title = COALESCE(%s, title),
                 frame_count = COALESCE(%s, frame_count),
                 source_hash = COALESCE(%s, source_hash),
                 embed_version = COALESCE(%s, embed_version),
+                chunk_count = COALESCE(%s, chunk_count),
+                page_count = COALESCE(%s, page_count),
+                storage_key = COALESCE(%s, storage_key),
                 progress = %s,
                 updated_at = now()
             WHERE id = %s
             """,
             (status, error, title, frame_count, source_hash, embed_version,
-             progress, video_id),
-        )
+             chunk_count, page_count, storage_key, progress, video_id),
+        ))
 
 
 def set_progress(video_id: str, progress: float) -> None:
-    with pool().connection() as conn:
-        conn.execute("UPDATE ms_videos SET progress = %s, updated_at = now() WHERE id = %s",
-                     (round(progress, 3), video_id))
+    _run(lambda conn: conn.execute(
+        "UPDATE ms_videos SET progress = %s, updated_at = now() WHERE id = %s",
+        (round(progress, 3), video_id)))
 
 
 def bump_attempts(video_id: str) -> int:
-    with pool().connection() as conn:
-        row = conn.execute(
-            "UPDATE ms_videos SET attempts = attempts + 1, updated_at = now() WHERE id = %s RETURNING attempts",
-            (video_id,),
-        ).fetchone()
+    row = _run(lambda conn: conn.execute(
+        "UPDATE ms_videos SET attempts = attempts + 1, updated_at = now() WHERE id = %s RETURNING attempts",
+        (video_id,),
+    ).fetchone())
     return row["attempts"] if row else 0
 
 
 def get_video(video_id: str) -> dict | None:
-    with pool().connection() as conn:
-        return conn.execute("SELECT * FROM ms_videos WHERE id = %s", (video_id,)).fetchone()
+    return _run(lambda conn: conn.execute(
+        "SELECT * FROM ms_videos WHERE id = %s", (video_id,)).fetchone())
 
 
 def find_duplicate(user_id: str, source_hash: str, exclude_id: str) -> dict | None:
     """An already-indexed video with the same content for the same user."""
-    with pool().connection() as conn:
-        return conn.execute(
+    return _run(lambda conn: conn.execute(
             """
             SELECT * FROM ms_videos
             WHERE user_id = %s AND source_hash = %s AND id <> %s AND status = 'indexed'
             LIMIT 1
             """,
             (user_id, source_hash, exclude_id),
-        ).fetchone()
+        ).fetchone())
 
 
 def list_videos(user_id: str, status: str | None = None) -> list[dict]:
@@ -157,33 +184,30 @@ def list_videos(user_id: str, status: str | None = None) -> list[dict]:
         q += " AND status = %s"
         params.append(status)
     q += " ORDER BY created_at DESC"
-    with pool().connection() as conn:
-        return conn.execute(q, tuple(params)).fetchall()
+    return _run(lambda conn: conn.execute(q, tuple(params)).fetchall())
 
 
 def videos_by_ids(ids: list[str]) -> dict[str, dict]:
     """Metadata join for search citations (title/url/source live here, not in Qdrant)."""
     if not ids:
         return {}
-    with pool().connection() as conn:
-        rows = conn.execute("SELECT * FROM ms_videos WHERE id = ANY(%s)", (ids,)).fetchall()
+    rows = _run(lambda conn: conn.execute(
+        "SELECT * FROM ms_videos WHERE id = ANY(%s)", (ids,)).fetchall())
     return {r["id"]: r for r in rows}
 
 
 def delete_video(video_id: str) -> None:
-    with pool().connection() as conn:
-        conn.execute("DELETE FROM ms_videos WHERE id = %s", (video_id,))
+    _run(lambda conn: conn.execute("DELETE FROM ms_videos WHERE id = %s", (video_id,)))
 
 
 # ── Fair scheduling (WFQ) ────────────────────────────────────────────────────
 
 def count_inflight() -> int:
     """How many videos currently occupy execution capacity (scheduled/running)."""
-    with pool().connection() as conn:
-        row = conn.execute(
-            "SELECT count(*) AS n FROM ms_videos WHERE status = ANY(%s)",
-            (list(INFLIGHT_STATUSES),),
-        ).fetchone()
+    row = _run(lambda conn: conn.execute(
+        "SELECT count(*) AS n FROM ms_videos WHERE status = ANY(%s)",
+        (list(INFLIGHT_STATUSES),),
+    ).fetchone())
     return row["n"] if row else 0
 
 
@@ -199,7 +223,8 @@ def wfq_claim(limit: int) -> list[dict]:
     """
     if limit <= 0:
         return []
-    with pool().connection() as conn:
+
+    def _claim(conn):
         picked = conn.execute(
             """
             SELECT id FROM (
@@ -219,26 +244,55 @@ def wfq_claim(limit: int) -> list[dict]:
             """
             UPDATE ms_videos SET status = 'queued', updated_at = now()
             WHERE id = ANY(%s) AND status = 'pending'
-            RETURNING id, user_id
+            RETURNING id, user_id, kind
             """,
             (ids,),
         ).fetchall()
+
+    return _run(_claim)
+
+
+def requeue_stale(stale_s: int, max_attempts: int) -> dict[str, int]:
+    """Reconciler: recover sources stranded in-flight by a hard-killed worker.
+
+    A SIGKILL is not a Python exception — the flow's `except` never runs, Prefect
+    marks the run Crashed and never reschedules it, and the row would sit in an
+    in-flight status forever (consuming dispatcher capacity). This sweep flips
+    rows whose `updated_at` stopped moving back to `pending` for re-admission,
+    or to `failed` (dead-letter) once they've burned `max_attempts` attempts so a
+    poison source can't loop forever. Atomic single statement: safe to run from
+    every dispatcher thread concurrently.
+    """
+    rows = _run(lambda conn: conn.execute(
+            """
+            UPDATE ms_videos SET
+                status = CASE WHEN attempts < %s THEN 'pending' ELSE 'failed' END,
+                error  = CASE WHEN attempts < %s
+                              THEN 'requeued: worker lost mid-ingest'
+                              ELSE 'dead-letter: exceeded max ingest attempts' END,
+                progress = NULL,
+                updated_at = now()
+            WHERE status = ANY(%s) AND updated_at < now() - make_interval(secs => %s)
+            RETURNING id, status
+            """,
+            (max_attempts, max_attempts, list(INFLIGHT_STATUSES), stale_s),
+        ).fetchall())
+    requeued = sum(1 for r in rows if r["status"] == "pending")
+    return {"requeued": requeued, "dead_lettered": len(rows) - requeued}
 
 
 # ── Bring-your-own-model (per-tenant LLM endpoint) ───────────────────────────
 
 def get_user_llm(user_id: str) -> dict | None:
-    with pool().connection() as conn:
-        return conn.execute("SELECT * FROM ms_user_llms WHERE user_id = %s",
-                            (user_id,)).fetchone()
+    return _run(lambda conn: conn.execute(
+        "SELECT * FROM ms_user_llms WHERE user_id = %s", (user_id,)).fetchone())
 
 
 def set_user_llm(user_id: str, *, provider: str, model: str,
                  base_url: str | None, api_key: str | None) -> dict:
     """Upsert a tenant's model endpoint. An empty api_key keeps the stored one
     (so users can change model/URL without re-pasting their secret)."""
-    with pool().connection() as conn:
-        return conn.execute(
+    return _run(lambda conn: conn.execute(
             """
             INSERT INTO ms_user_llms (user_id, provider, model, base_url, api_key)
             VALUES (%s, %s, %s, %s, %s)
@@ -251,9 +305,8 @@ def set_user_llm(user_id: str, *, provider: str, model: str,
             RETURNING *
             """,
             (user_id, provider, model, base_url, api_key),
-        ).fetchone()
+        ).fetchone())
 
 
 def delete_user_llm(user_id: str) -> None:
-    with pool().connection() as conn:
-        conn.execute("DELETE FROM ms_user_llms WHERE user_id = %s", (user_id,))
+    _run(lambda conn: conn.execute("DELETE FROM ms_user_llms WHERE user_id = %s", (user_id,)))

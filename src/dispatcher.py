@@ -30,13 +30,25 @@ from . import config, db, jobs
 def dispatch_once() -> int:
     """Admit as many fairly-chosen pending videos as free capacity allows.
     Returns how many were dispatched this tick."""
+    # Reconciler: recover sources stranded by a hard-killed worker. A SIGKILL
+    # is not an exception — nothing writes `failed`, Prefect marks the run
+    # Crashed and never reschedules it, and the row would occupy in-flight
+    # capacity forever (two wedged rows deadlock all ingest at the default
+    # DISPATCH_MAX_INFLIGHT=2). Rows whose updated_at stopped moving go back
+    # to `pending` for fair re-admission; repeat offenders dead-letter to
+    # `failed` after MAX_INGEST_ATTEMPTS. Atomic statement — safe with one
+    # sweeper per worker replica.
+    swept = db.requeue_stale(config.STALE_INFLIGHT_S, config.MAX_INGEST_ATTEMPTS)
+    if swept["requeued"] or swept["dead_lettered"]:
+        print(f"[dispatch] reconciler: requeued {swept['requeued']}, "
+              f"dead-lettered {swept['dead_lettered']}")
     slots = config.DISPATCH_MAX_INFLIGHT - db.count_inflight()
     if slots <= 0:
         return 0
     claimed = db.wfq_claim(slots)
     for row in claimed:
         try:
-            jobs.enqueue_video(row["id"], row["user_id"])
+            jobs.enqueue_source(row)
         except Exception as exc:
             # Couldn't reach Prefect — put it back so it's retried next tick.
             db.set_status(row["id"], "pending", error=f"dispatch: {exc}")

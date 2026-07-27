@@ -21,6 +21,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from . import config, db
+from .api.compat import router as compat_router
+from .api.documents import router as documents_router
 from .api.search import router as search_router
 from .api.videos import router as videos_router
 from .rag import vector_store
@@ -43,4 +45,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="MomentSearch", version="1.0.0", lifespan=lifespan)
 app.include_router(videos_router)
+app.include_router(documents_router)   # /api/documents + /api/sources
+app.include_router(compat_router)      # /admin/* grader-contract aliases
 app.include_router(search_router)

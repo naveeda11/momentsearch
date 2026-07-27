@@ -93,8 +93,14 @@ def gcs_service_account_info() -> dict:
 # Bucket key layout — every key is user-scoped (tenant isolation at the path level):
 #   uploads/{user_id}/{video_id}.{ext}      raw uploaded video (presigned PUT target)
 #   frames/{user_id}/{video_id}/NNNNNN.jpg  downscaled frame thumbnails (citations)
+#   docs/{user_id}/{doc_id}.{ext}           raw paper/deck (fetch checkpoint)
+#   pages/{user_id}/{doc_id}/NNNNNN.jpg     page/slide renders (citations + captions)
+#   parsed/{user_id}/{doc_id}.json          parse+caption checkpoint (crash resume)
 UPLOAD_KEY_PREFIX = "uploads/"
 FRAME_KEY_PREFIX = "frames/"
+DOC_KEY_PREFIX = "docs/"
+PAGE_KEY_PREFIX = "pages/"
+PARSED_KEY_PREFIX = "parsed/"
 
 # --- Presigned uploads (browser -> bucket, bypassing the API) -----------------
 PRESIGN_EXPIRY_S = _int("PRESIGN_EXPIRY_S", 900)          # presigned PUT lifetime
@@ -102,15 +108,44 @@ PRESIGN_GET_EXPIRY_S = _int("PRESIGN_GET_EXPIRY_S", 3600)  # thumbnails / playba
 MAX_UPLOAD_MB = _int("MAX_UPLOAD_MB", 2048)                # register rejects bigger objects
 ALLOWED_UPLOAD_TYPES = ("video/",)                         # content-type must start with
 
-# --- Video ingest lifecycle ---------------------------------------------------
+# --- Source ingest lifecycle ---------------------------------------------------
 # pending  = registered, waiting in our fair queue (not yet sent to Prefect)
 # queued   = the dispatcher picked it and scheduled a Prefect run
 # fetching = acquiring the source file; sampling = frames + dedup + thumbnails;
-# embedding = CLIP + Qdrant upsert; skipped = duplicate (user_id, source_hash).
-VIDEO_STATUSES = ("pending", "queued", "fetching", "sampling", "embedding",
-                  "indexed", "skipped", "failed")
+# parsing  = documents: page/slide text extraction + page renders;
+# enriching = documents: vision-LLM captions for image-heavy pages/slides;
+# embedding = embeddings + Qdrant upsert; skipped = duplicate (user_id, source_hash).
+VIDEO_STATUSES = ("pending", "queued", "fetching", "sampling", "parsing",
+                  "enriching", "embedding", "indexed", "skipped", "failed")
 # In-flight = occupying execution capacity (scheduled or running).
-INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "embedding")
+INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "parsing", "enriching",
+                     "embedding")
+
+# --- Document ingest (papers + decks) ------------------------------------------
+# Papers (PDF) and decks (PDF/PPTX) ride the same queue and the same text
+# collection as video transcripts; each chunk carries a page/slide locator so
+# citations deep-link. Parsing is pymupdf (PDF) / python-pptx (PPTX, text +
+# speaker notes; no LibreOffice raster — PDF decks get full page renders).
+DOC_CHUNK_CHARS = _int("DOC_CHUNK_CHARS", 1000)       # target chunk size (papers)
+DOC_CHUNK_OVERLAP = _int("DOC_CHUNK_OVERLAP", 150)    # chars carried between chunks
+DOC_MAX_PAGES = _int("DOC_MAX_PAGES", 300)            # hard cap per document
+# A page/slide with less extractable text than this is "image-only" and gets a
+# vision-LLM caption during the enrich stage (figures, charts, scans).
+CAPTION_MIN_TEXT_CHARS = _int("CAPTION_MIN_TEXT_CHARS", 150)
+DOC_CAPTION_ENABLED = _envbool("DOC_CAPTION_ENABLED", True)
+PAGE_RENDER_WIDTH = _int("PAGE_RENDER_WIDTH", 960)    # page/slide JPEG render width
+ALLOWED_DOC_TYPES = (
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+)
+
+# --- Resilience (reconciler) ----------------------------------------------------
+# A hard-killed worker can't write `failed`, so its row would stay in-flight
+# forever. The dispatcher sweeps rows whose updated_at stopped moving back to
+# pending (or dead-letters them after MAX_INGEST_ATTEMPTS). Every doc stage
+# touches updated_at frequently via set_progress, so live runs are never swept.
+STALE_INFLIGHT_S = _int("STALE_INFLIGHT_S", 900)
+MAX_INGEST_ATTEMPTS = _int("MAX_INGEST_ATTEMPTS", 3)
 
 # --- Fair scheduling (WFQ) ----------------------------------------------------
 # FIFO (default off): register enqueues to Prefect immediately -> Prefect runs
@@ -256,6 +291,13 @@ SEED_SAMPLE_VIDEOS = _envbool("SEED_SAMPLE_VIDEOS", True)
 # --- Work orchestration (Prefect Cloud) ----------------------------------------
 # The SDK reads PREFECT_API_URL / PREFECT_API_KEY from the environment directly.
 # WORKER_CONCURRENCY is read by worker.py; retries live on the flow's tasks.
+
+# --- Queue backend (stretch: bring your own broker) -----------------------------
+# prefect (default): API/dispatcher schedule Prefect Cloud runs; worker.py serves.
+# redis: producers XADD to a Redis Stream (src/broker.py); broker_worker.py
+#        consumers execute the same flows with at-least-once delivery,
+#        XAUTOCLAIM visibility timeout, ack-after-upsert, and a DLQ.
+QUEUE_BACKEND = os.getenv("QUEUE_BACKEND", "prefect").strip().lower()
 
 # --- Qdrant ----------------------------------------------------------------------
 # One shared multi-tenant collection: every point carries user_id (tenant payload

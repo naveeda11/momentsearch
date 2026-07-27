@@ -15,8 +15,26 @@ services:
     build: .
     command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001
     env_file: .env
+    cpuset: "3-11"              # ingest embedder stays off the read-path cores
     volumes:
       - hf_cache:/root/.cache     # model weights cached across restarts
+    restart: unless-stopped
+
+  # Read-path twin of `clip`. Queries must NEVER wait behind bulk ingest
+  # embeddings — a backfill pushing 256-chunk batches through one model lock
+  # made search p95 jump 14x. The api embeds queries HERE; workers keep using
+  # `clip`. Hot path and heavy path scale and fail on their own.
+  # cpu_shares: on a single host, ingest at full parallelism can still starve
+  # the read path of CPU. Shares are soft priority — reads win contention,
+  # ingest keeps every idle cycle (deployed, these are separate VMs anyway).
+  clip-query:
+    build: .
+    command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001
+    env_file: .env
+    cpu_shares: 4096
+    cpuset: "0-2"               # dedicated read-path cores (deployed: its own VM)
+    volumes:
+      - hf_cache:/root/.cache
     restart: unless-stopped
 
   # STARTUP GATE — indexes the four sample talks and exits. api + worker wait
@@ -42,14 +60,17 @@ services:
     build: .
     ports:
       - "8000:8000"
+      - "8100:8000"   # Assignment 3 graders default to BASE_URL=http://localhost:8100
     env_file: .env
     environment:
-      CLIP_SERVICE_URL: ${CLIP_SERVICE_URL:-http://clip:8001}
+      CLIP_SERVICE_URL: ${API_CLIP_SERVICE_URL:-http://clip-query:8001}   # read path: dedicated
+    cpu_shares: 4096              # read path wins CPU contention (see clip-query)
+    cpuset: "0-2"                 # shares cores with clip-query, never with ingest
     volumes:
       - ./data:/app/data          # STORAGE_PROVIDER=local only (dev)
       - hf_cache:/root/.cache
     depends_on:
-      clip:
+      clip-query:
         condition: service_started
       seed:
         condition: service_completed_successfully   # UI up only after samples ready
@@ -64,7 +85,13 @@ services:
       # One worker process executes up to WORKER_CONCURRENCY runs at once.
       # With the clip service doing the embedding, each run is light
       # (download + ffmpeg only) — raise this without adding RAM for models.
-      WORKER_CONCURRENCY: 2
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-2}
+      # Shell-overridable for the resilience rehearsal (drop the stale sweep
+      # to 60s) and the throughput benchmark (raise in-flight with workers).
+      STALE_INFLIGHT_S: ${STALE_INFLIGHT_S:-900}
+      DISPATCH_MAX_INFLIGHT: ${DISPATCH_MAX_INFLIGHT:-2}
+    cpu_shares: 512               # heavy path yields CPU to the read path under contention
+    cpuset: "3-11"                # ingest never touches the read-path cores
     volumes:
       - ./data:/app/data
       - hf_cache:/root/.cache
@@ -76,6 +103,32 @@ services:
     restart: unless-stopped
     # Need more throughput? Replicas multiply it (all share the one clip model):
     # docker compose up -d --scale worker=3   (-> 6 videos at once)
+
+  # ── Stretch: self-hosted broker (QUEUE_BACKEND=redis) ─────────────────────
+  # Start with: docker compose --profile redis up -d
+  # The redis broker replaces Prefect scheduling; broker-worker consumes the
+  # stream with at-least-once delivery + visibility timeout + DLQ (src/broker.py).
+  redis:
+    profiles: ["redis"]
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  broker-worker:
+    profiles: ["redis"]
+    build: .
+    command: python -m src.broker_worker
+    env_file: .env
+    environment:
+      CLIP_SERVICE_URL: ${CLIP_SERVICE_URL:-http://clip:8001}
+      QUEUE_BACKEND: redis
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./data:/app/data
+      - hf_cache:/root/.cache
+    depends_on:
+      - clip
+      - redis
+    restart: unless-stopped
 
 volumes:
   hf_cache:
